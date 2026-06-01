@@ -93,6 +93,29 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(account["status"], "限流")
             self.assertEqual(account["quota"], 0)
 
+    def test_add_account_items_preserves_registration_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "token-1",
+                        "email": "new@example.com",
+                        "password": "secret-password",
+                        "refresh_token": "refresh-1",
+                        "id_token": "id-1",
+                    }
+                ]
+            )
+            account = service.get_account("token-1")
+
+            self.assertIsNotNone(account)
+            self.assertEqual(account["email"], "new@example.com")
+            self.assertEqual(account["password"], "secret-password")
+            self.assertEqual(account["refresh_token"], "refresh-1")
+            self.assertEqual(account["id_token"], "id-1")
+
 
 class TokenLogTests(unittest.TestCase):
     def test_anonymize_token_hides_raw_value(self) -> None:
