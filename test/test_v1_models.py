@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest.mock import patch
 
 import requests
 
@@ -13,6 +14,16 @@ BASE_URL = "http://localhost:8000"
 
 
 class ModelListTests(unittest.TestCase):
+    def test_list_models_falls_back_when_upstream_fails(self):
+        with patch.object(openai_v1_models.OpenAIBackendAPI, "list_models", side_effect=RuntimeError("anon 401")):
+            result = openai_v1_models.list_models()
+
+        ids = {item["id"] for item in result["data"]}
+        self.assertIn("auto", ids)
+        self.assertIn("gpt-5", ids)
+        self.assertIn("gpt-image-2", ids)
+        self.assertIn("codex-gpt-image-2", ids)
+
     def test_list_models_function(self):
         """测试直接调用服务层获取模型列表。"""
         result = openai_v1_models.list_models()

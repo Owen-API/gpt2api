@@ -3,7 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Condition, Lock
 from typing import Any
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from services.config import config
@@ -50,6 +50,27 @@ class AccountService:
     def _now() -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
+    @staticmethod
+    def _decode_jwt_payload(token: str) -> dict:
+        try:
+            payload = str(token or "").split(".")[1]
+            payload += "=" * ((4 - len(payload) % 4) % 4)
+            import base64
+            import json
+            data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _timestamp_to_iso(value: object) -> str:
+        try:
+            ts = int(value)
+        except (TypeError, ValueError):
+            return ""
+        tz = timezone(timedelta(hours=8))
+        return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz).isoformat()
+
     def _load_accounts(self) -> dict[str, dict]:
         accounts = self.storage.load_accounts()
         return {
@@ -71,20 +92,67 @@ class AccountService:
             return True
         return int(account.get("quota") or 0) > 0
 
+    @staticmethod
+    def _normalize_source_type(value: object) -> str:
+        return str(value or "web").strip().lower() or "web"
+
+    @staticmethod
+    def _normalize_account_type(value: object) -> str | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        key = raw.lower().replace("-", "_").replace(" ", "_")
+        compact = key.replace("_", "")
+        aliases = {
+            "free": "free",
+            "plus": "Plus",
+            "pro": "Pro",
+            "prolite": "ProLite",
+            "team": "Team",
+            "business": "Team",
+            "enterprise": "Enterprise",
+        }
+        return aliases.get(compact) or aliases.get(key) or raw
+
+    def _search_account_type(self, payload: object) -> str | None:
+        if isinstance(payload, dict):
+            for key in ("plan_type", "account_plan", "account_type", "subscription_type", "type"):
+                plan = self._normalize_account_type(payload.get(key))
+                if plan:
+                    return plan
+            for value in payload.values():
+                plan = self._search_account_type(value)
+                if plan:
+                    return plan
+        elif isinstance(payload, list):
+            for value in payload:
+                plan = self._search_account_type(value)
+                if plan:
+                    return plan
+        return None
+
     def _normalize_account(self, item: dict) -> dict | None:
         if not isinstance(item, dict):
             return None
-        access_token = item.get("access_token") or ""
+        access_token = item.get("access_token") or item.get("accessToken") or ""
         if not access_token:
             return None
         normalized = dict(item)
+        normalized.pop("accessToken", None)
         normalized["access_token"] = access_token
+        if str(normalized.get("type") or "").strip().lower() == "codex":
+            normalized["export_type"] = "codex"
+            normalized.pop("type", None)
         normalized["type"] = normalized.get("type") or "free"
         normalized["status"] = normalized.get("status") or "正常"
         normalized["quota"] = max(0, int(normalized.get("quota") if normalized.get("quota") is not None else 0))
         normalized["image_quota_unknown"] = bool(normalized.get("image_quota_unknown"))
         normalized["email"] = normalized.get("email") or None
         normalized["user_id"] = normalized.get("user_id") or None
+        source_type = normalized.get("source_type")
+        if not source_type and str(normalized.get("export_type") or "").strip().lower() == "codex":
+            source_type = "codex"
+        normalized["source_type"] = self._normalize_source_type(source_type)
         limits_progress = normalized.get("limits_progress")
         normalized["limits_progress"] = limits_progress if isinstance(limits_progress, list) else []
         normalized["default_model_slug"] = normalized.get("default_model_slug") or None
@@ -187,16 +255,11 @@ class AccountService:
             self._save_accounts()
 
     def remove_invalid_token(self, access_token: str, event: str) -> bool:
-        if not config.auto_remove_invalid_accounts:
+        if access_token:
             self.update_account(access_token, {"status": "异常", "quota": 0})
-            return False
-        removed = bool(self.delete_accounts([access_token])["removed"])
-        if removed:
-            log_service.add(LOG_TYPE_ACCOUNT, "自动移除异常账号",
+            log_service.add(LOG_TYPE_ACCOUNT, "标记异常账号",
                             {"source": event, "token": anonymize_token(access_token)})
-        elif access_token:
-            self.update_account(access_token, {"status": "异常", "quota": 0})
-        return removed
+        return False
 
     def get_account(self, access_token: str) -> dict | None:
         if not access_token:
@@ -219,8 +282,33 @@ class AccountService:
             ]
 
     def add_account_items(self, items: list[dict]) -> dict:
-        tokens = [str(item.get("access_token") or "").strip() for item in items if isinstance(item, dict)]
-        return self.add_accounts(tokens)
+        payloads = [item for item in items if isinstance(item, dict)]
+        if not payloads:
+            return {"added": 0, "skipped": 0, "items": self.list_accounts()}
+
+        with self._lock:
+            added = 0
+            skipped = 0
+            for item in payloads:
+                access_token = str(item.get("access_token") or item.get("accessToken") or "").strip()
+                if not access_token:
+                    continue
+                current = self._accounts.get(access_token)
+                if current is None:
+                    added += 1
+                    self._cumulative_total += 1
+                    self._save_cumulative_total()
+                    current = {"created_at": self._now()}
+                else:
+                    skipped += 1
+                account = self._normalize_account({**current, **item, "access_token": access_token})
+                if account is not None:
+                    self._accounts[access_token] = account
+            self._save_accounts()
+            items = [dict(item) for item in self._accounts.values()]
+            log_service.add(LOG_TYPE_ACCOUNT, f"新增 {added} 个账号，跳过 {skipped} 个",
+                            {"added": added, "skipped": skipped})
+        return {"added": added, "skipped": skipped, "items": items}
 
     def add_accounts(self, tokens: list[str]) -> dict:
         tokens = list(dict.fromkeys(token for token in tokens if token))
@@ -282,11 +370,6 @@ class AccountService:
             account = self._normalize_account({**current, **updates, "access_token": access_token})
             if account is None:
                 return None
-            if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
-                self._accounts.pop(access_token, None)
-                self._save_accounts()
-                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
-                return None
             self._accounts[access_token] = account
             self._save_accounts()
             log_service.add(LOG_TYPE_ACCOUNT, "更新账号",
@@ -318,11 +401,6 @@ class AccountService:
                 next_item["fail"] = int(next_item.get("fail") or 0) + 1
             account = self._normalize_account(next_item)
             if account is None:
-                return None
-            if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
-                self._accounts.pop(access_token, None)
-                self._save_accounts()
-                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
                 return None
             self._accounts[access_token] = account
             self._save_accounts()
@@ -369,6 +447,56 @@ class AccountService:
             "errors": errors,
             "items": self.list_accounts(),
         }
+
+    def build_export_items(self, access_tokens: list[str] | None = None) -> list[dict[str, str]]:
+        target_tokens = set(token for token in (access_tokens or []) if token)
+        with self._lock:
+            accounts = [
+                dict(item)
+                for item in self._accounts.values()
+                if not target_tokens or str(item.get("access_token") or "") in target_tokens
+            ]
+
+        items: list[dict[str, str]] = []
+        for account in accounts:
+            access_token = str(account.get("access_token") or "").strip()
+            refresh_token = str(account.get("refresh_token") or "").strip()
+            id_token = str(account.get("id_token") or "").strip()
+            if not access_token or not refresh_token or not id_token:
+                continue
+
+            access_payload = self._decode_jwt_payload(access_token)
+            id_payload = self._decode_jwt_payload(id_token)
+            auth_claim = access_payload.get("https://api.openai.com/auth")
+            auth_claim = auth_claim if isinstance(auth_claim, dict) else {}
+            profile_claim = access_payload.get("https://api.openai.com/profile")
+            profile_claim = profile_claim if isinstance(profile_claim, dict) else {}
+
+            email = (
+                str(account.get("email") or "").strip()
+                or str(profile_claim.get("email") or "").strip()
+                or str(id_payload.get("email") or "").strip()
+            )
+            account_id = (
+                str(account.get("account_id") or "").strip()
+                or str(auth_claim.get("chatgpt_account_id") or "").strip()
+                or str(account.get("user_id") or "").strip()
+            )
+            item = {
+                "type": str(account.get("export_type") or "codex"),
+                "email": email,
+                "account_id": account_id,
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "id_token": id_token,
+                "expired": self._timestamp_to_iso(access_payload.get("exp")),
+                "last_refresh": self._timestamp_to_iso(access_payload.get("iat")),
+            }
+            password = str(account.get("password") or "").strip()
+            if password:
+                item["password"] = password
+            items.append(item)
+        return items
 
 
     def get_stats(self) -> dict:

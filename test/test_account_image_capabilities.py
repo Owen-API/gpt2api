@@ -66,6 +66,33 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(updated["status"], "正常")
             self.assertTrue(updated["image_quota_unknown"])
 
+    def test_invalid_accounts_are_marked_not_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_accounts(["token-1"])
+
+            removed = service.remove_invalid_token("token-1", "unit-test")
+            account = service.get_account("token-1")
+
+            self.assertFalse(removed)
+            self.assertIsNotNone(account)
+            self.assertEqual(account["status"], "异常")
+            self.assertEqual(account["quota"], 0)
+
+    def test_rate_limited_accounts_are_marked_not_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_accounts(["token-1"])
+            service.update_account("token-1", {"status": "正常", "quota": 1})
+
+            updated = service.mark_image_result("token-1", success=True)
+            account = service.get_account("token-1")
+
+            self.assertIsNotNone(updated)
+            self.assertIsNotNone(account)
+            self.assertEqual(account["status"], "限流")
+            self.assertEqual(account["quota"], 0)
+
 
 class TokenLogTests(unittest.TestCase):
     def test_anonymize_token_hides_raw_value(self) -> None:
