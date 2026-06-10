@@ -2,50 +2,52 @@ from __future__ import annotations
 
 from typing import Any
 
+from services.account_service import account_service
 from services.openai_backend_api import OpenAIBackendAPI
-from utils.helper import IMAGE_MODELS
-from utils.log import logger
-
-
-FALLBACK_TEXT_MODELS = (
-    "auto",
-    "gpt-5",
-    "gpt-5-1",
-    "gpt-5-2",
-    "gpt-5-3",
-    "gpt-5-3-mini",
-    "gpt-5-5",
-    "gpt-5-mini",
-)
-
-
-def _model_item(model: str, owned_by: str = "chatgpt") -> dict[str, Any]:
-    return {
-        "id": model,
-        "object": "model",
-        "created": 0,
-        "owned_by": owned_by,
-        "permission": [],
-        "root": model,
-        "parent": None,
-    }
-
-
-def _base_model_list() -> dict[str, Any]:
-    try:
-        return OpenAIBackendAPI().list_models()
-    except Exception as exc:
-        logger.warning({"event": "models_fallback", "error": str(exc)})
-        return {"object": "list", "data": [_model_item(model) for model in FALLBACK_TEXT_MODELS]}
+from utils.helper import CODEX_IMAGE_MODEL
 
 
 def list_models() -> dict[str, Any]:
-    result = _base_model_list()
+    result = OpenAIBackendAPI().list_models()
     data = result.get("data")
     if not isinstance(data, list):
         return result
     seen = {str(item.get("id") or "").strip() for item in data if isinstance(item, dict)}
-    for model in sorted(IMAGE_MODELS):
+    dynamic_models: set[str] = set()
+    accounts = account_service.list_accounts()
+    web_image_accounts = [
+        account
+        for account in accounts
+        if isinstance(account, dict)
+    ]
+    codex_types = {
+        normalized
+        for account in accounts
+        if isinstance(account, dict)
+           and account_service._normalize_source_type(account.get("source_type")) == "codex"
+           and (normalized := account_service._normalize_account_type(account.get("type")))
+    }
+
+    if web_image_accounts:
+        dynamic_models.add("gpt-image-2")
+    if codex_types & {"Plus", "Team", "Pro"}:
+        dynamic_models.add(CODEX_IMAGE_MODEL)
+    if "Plus" in codex_types:
+        dynamic_models.add(f"plus-{CODEX_IMAGE_MODEL}")
+    if "Team" in codex_types:
+        dynamic_models.add(f"team-{CODEX_IMAGE_MODEL}")
+    if "Pro" in codex_types:
+        dynamic_models.add(f"pro-{CODEX_IMAGE_MODEL}")
+
+    for model in sorted(dynamic_models):
         if model not in seen:
-            data.append(_model_item(model, owned_by="chatgpt2api"))
+            data.append({
+                "id": model,
+                "object": "model",
+                "created": 0,
+                "owned_by": "chatgpt2api",
+                "permission": [],
+                "root": model,
+                "parent": None,
+            })
     return result

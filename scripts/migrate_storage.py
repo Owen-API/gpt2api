@@ -3,9 +3,8 @@
 存储后端数据迁移脚本
 
 用法：
-  python scripts/migrate_storage.py --from json --to postgres --to-url postgresql://...
-  python scripts/migrate_storage.py --from sqlite --from-url sqlite:////app/data/accounts.db --to postgres --to-url postgresql://...
-  python scripts/migrate_storage.py --from postgres --from-url postgresql://... --to git
+  python scripts/migrate_storage.py --from json --to postgres
+  python scripts/migrate_storage.py --from postgres --to git
   python scripts/migrate_storage.py --export accounts.json
   python scripts/migrate_storage.py --import accounts.json
 """
@@ -22,38 +21,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
 from services.storage.factory import create_storage_backend
-
-
-_DATABASE_URL_UNSET = object()
-
-
-def _with_storage_env(backend: str, database_url: object = _DATABASE_URL_UNSET):
-    class StorageEnv:
-        def __enter__(self):
-            self.original_backend = os.environ.get("STORAGE_BACKEND")
-            self.original_database_url = os.environ.get("DATABASE_URL")
-            os.environ["STORAGE_BACKEND"] = backend
-            if database_url is not _DATABASE_URL_UNSET:
-                os.environ["DATABASE_URL"] = database_url
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            if self.original_backend is None:
-                os.environ.pop("STORAGE_BACKEND", None)
-            else:
-                os.environ["STORAGE_BACKEND"] = self.original_backend
-            if self.original_database_url is None:
-                os.environ.pop("DATABASE_URL", None)
-            else:
-                os.environ["DATABASE_URL"] = self.original_database_url
-
-    return StorageEnv()
-
-
-def _create_backend(backend: str, database_url: str | None = None):
-    url = database_url if database_url is not None else _DATABASE_URL_UNSET
-    with _with_storage_env(backend, url):
-        return create_storage_backend(DATA_DIR)
 
 
 def export_to_json(output_file: str):
@@ -97,32 +64,34 @@ def import_from_json(input_file: str):
     print(f"[migrate] Imported {len(accounts)} accounts")
 
 
-def migrate_data(
-    from_backend: str,
-    to_backend: str,
-    from_url: str | None = None,
-    to_url: str | None = None,
-    include_auth_keys: bool = False,
-):
+def migrate_data(from_backend: str, to_backend: str):
     """从一个存储后端迁移到另一个"""
     print(f"[migrate] Migrating from {from_backend} to {to_backend}")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    from_storage = _create_backend(from_backend, from_url)
-    accounts = from_storage.load_accounts()
-    auth_keys = from_storage.load_auth_keys() if include_auth_keys else []
-    print(f"[migrate] Loaded {len(accounts)} accounts from {from_backend}")
-    if include_auth_keys:
-        print(f"[migrate] Loaded {len(auth_keys)} auth keys from {from_backend}")
-
-    to_storage = _create_backend(to_backend, to_url)
-    to_storage.save_accounts(accounts)
-    print(f"[migrate] Saved {len(accounts)} accounts to {to_backend}")
-    if include_auth_keys:
-        to_storage.save_auth_keys(auth_keys)
-        print(f"[migrate] Saved {len(auth_keys)} auth keys to {to_backend}")
-
-    print("[migrate] Migration completed successfully!")
+    # 保存原始环境变量
+    original_backend = os.environ.get("STORAGE_BACKEND")
+    
+    try:
+        # 从源后端读取数据
+        os.environ["STORAGE_BACKEND"] = from_backend
+        from_storage = create_storage_backend(DATA_DIR)
+        accounts = from_storage.load_accounts()
+        print(f"[migrate] Loaded {len(accounts)} accounts from {from_backend}")
+        
+        # 写入目标后端
+        os.environ["STORAGE_BACKEND"] = to_backend
+        to_storage = create_storage_backend(DATA_DIR)
+        to_storage.save_accounts(accounts)
+        print(f"[migrate] Saved {len(accounts)} accounts to {to_backend}")
+        
+        print(f"[migrate] Migration completed successfully!")
+        
+    finally:
+        # 恢复原始环境变量
+        if original_backend:
+            os.environ["STORAGE_BACKEND"] = original_backend
+        elif "STORAGE_BACKEND" in os.environ:
+            del os.environ["STORAGE_BACKEND"]
 
 
 def main():
@@ -132,13 +101,10 @@ def main():
         epilog="""
 示例:
   # 从 JSON 迁移到 PostgreSQL
-  python scripts/migrate_storage.py --from json --to postgres --to-url postgresql://user:password@host:5432/chatgpt2api
-
-  # 从 SQLite 迁移到 PostgreSQL
-  python scripts/migrate_storage.py --from sqlite --from-url sqlite:////app/data/accounts.db --to postgres --to-url postgresql://user:password@host:5432/chatgpt2api --include-auth-keys
+  python scripts/migrate_storage.py --from json --to postgres
   
   # 从 PostgreSQL 迁移到 Git
-  python scripts/migrate_storage.py --from postgres --from-url postgresql://user:password@host:5432/chatgpt2api --to git
+  python scripts/migrate_storage.py --from postgres --to git
   
   # 导出当前数据到 JSON 文件
   python scripts/migrate_storage.py --export backup.json
@@ -167,21 +133,6 @@ def main():
         help="目标存储后端",
     )
     parser.add_argument(
-        "--from-url",
-        dest="from_url",
-        help="源数据库连接字符串；迁移 sqlite/postgres 时建议显式指定",
-    )
-    parser.add_argument(
-        "--to-url",
-        dest="to_url",
-        help="目标数据库连接字符串；迁移到 postgres/sqlite 时建议显式指定",
-    )
-    parser.add_argument(
-        "--include-auth-keys",
-        action="store_true",
-        help="同时迁移 auth_keys",
-    )
-    parser.add_argument(
         "--export",
         dest="export_file",
         metavar="FILE",
@@ -198,13 +149,7 @@ def main():
     
     # 检查参数
     if args.from_backend and args.to_backend:
-        migrate_data(
-            args.from_backend,
-            args.to_backend,
-            from_url=args.from_url,
-            to_url=args.to_url,
-            include_auth_keys=args.include_auth_keys,
-        )
+        migrate_data(args.from_backend, args.to_backend)
     elif args.export_file:
         export_to_json(args.export_file)
     elif args.import_file:
